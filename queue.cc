@@ -42,7 +42,7 @@ class EntryQueue {
     return EntryQueue(metadata, queue, size);
   }
 
-  bool Enqueue(size_t size) {
+  Entry* PushEntry() {
     size_t back;
     size_t new_back;
     do {
@@ -51,15 +51,17 @@ class EntryQueue {
 
       new_back = (back + 1) % max_elements_;
       if (new_back == front) {
-          return false;
+          return nullptr;
       }
 
       // Commit the entry.
     } while(!metadata_->back.compare_exchange_weak(back, new_back));
-    queue_[back].size = size;
-    queue_[back].ready = true;
 
-    return true;
+    // Ready should be cleared on creation and on each PopEntry() call
+    // keeping newly allocated instances initialized.
+    assert(queue_[back].ready == false);
+
+    return &queue_[back];
   }
 
   enum Status {
@@ -184,9 +186,13 @@ class PCQueue {
   }
 
   bool Enqueue(const char* data, size_t size) {
+    EntryQueue::Entry* entry = nullptr;
+    // Okay to spin because consumer will eventually wake up.
+    while ((entry = entry_queue_.PushEntry()) == nullptr);
+    entry->size = size;
     if (!blob_queue_.Enqueue(data, size))
       return false;
-    while (!entry_queue_.Enqueue(size));
+    entry->ready = true;
     return true;
   }
 
@@ -361,12 +367,14 @@ void TestBlobQueue() {
 void TestEntryQueue() {
   EntryQueue queue = EntryQueue::Create(region, sizeof(region), true);
   std::deque<size_t> amts;
-  do {
+  EntryQueue::Entry* entry = nullptr;
+  while ((entry = queue.PushEntry()) != nullptr) {
     size_t amt = rand();
+    entry->size = amt;
     amts.push_back(amt);
     printf ("%zd, ", amts.back());
-  } while (queue.Enqueue(amts.back()));
-  amts.pop_back();
+    entry->ready = true;
+  }
   printf("\n");
 
   printf("Total In Queue %zd\n", amts.size());
@@ -377,12 +385,13 @@ void TestEntryQueue() {
   assert(out == amts.front());
   amts.pop_front();
 
-  do {
+  while ((entry = queue.PushEntry()) != nullptr) {
     size_t amt = rand();
+    entry->size = amt;
     amts.push_back(amt);
-    printf ("%zd, ", amt);
-  } while (queue.Enqueue(amts.back()));
-  amts.pop_back();
+    printf ("%zd, ", amts.back());
+    entry->ready = true;
+  }
   printf("\n");
 
   printf("Total In Queue %zd\n", amts.size());
@@ -402,8 +411,8 @@ void TestEntryQueue() {
 }
 
 int main(void) {
-//  TestEntryQueue();
+  TestEntryQueue();
 //  TestBlobQueue();
-  TestPCQueue();
+//  TestPCQueue();
   return 0;
 }
