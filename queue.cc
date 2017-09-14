@@ -13,15 +13,16 @@
 
 struct Metadata {
   Metadata() : front(0), back(0) {}
-  std::atomic<size_t> front;
-  std::atomic<size_t> back;
+  std::atomic<uint_fast32_t> front;
+  std::atomic<uint_fast32_t> back;
 };
 
+static constexpr uint32_t kBadPos = static_cast<uint32_t>(-1);
 struct Entry {
   Entry() : ready(false), queue_position(0), size(0) {}
   std::atomic<bool> ready; // TODO(ajwong): fence?
-  size_t queue_position;
-  size_t size;
+  uint32_t queue_position;
+  uint32_t size;
 };
 
 class EntryQueue {
@@ -44,10 +45,10 @@ class EntryQueue {
   }
 
   Entry* PushEntry() {
-    size_t back;
-    size_t new_back;
+    uint32_t back;
+    uint32_t new_back;
     do {
-      size_t front = metadata_->front;
+      uint32_t front = metadata_->front;
       back = metadata_->back;
 
       new_back = (back + 1) % max_elements_;
@@ -114,10 +115,8 @@ class BlobQueue {
     return BlobQueue(metadata, queue, size);
   }
 
-  static constexpr size_t kBadPos = static_cast<size_t>(-1);
-
   size_t EnqueueBlob(const char* data, size_t size) {
-    size_t front, back, new_back, new_back_no_mod;
+    uint32_t front, back, new_back, new_back_no_mod;
     do {
       front = metadata_->front;
       back = metadata_->back;
@@ -191,8 +190,8 @@ class PCQueue {
     entry->queue_position = blob_queue_.EnqueueBlob(data, size);
     entry->size = size;
     entry->ready = true;
-    // queue_position == BlobQueue::kBadPos if the BlobQueue is out of space.
-    return entry->queue_position != BlobQueue::kBadPos;
+    // queue_position == kBadPos if the BlobQueue is out of space.
+    return entry->queue_position != kBadPos;
   }
 
   enum Status {
@@ -215,7 +214,7 @@ class PCQueue {
       }
 
       // Skip tombstoned entries.
-      if (entry->queue_position != BlobQueue::kBadPos) {
+      if (entry->queue_position != kBadPos) {
         break;
       }
       printf("\nSkip toombstone\n");
@@ -327,7 +326,7 @@ void TestBlobQueue() {
     buf = std::string(amt, fill);
     printf("%d[%zd], ", fill, amt);
     fill++;
-  } while (queue.EnqueueBlob(buf.data(), buf.size()) != BlobQueue::kBadPos);
+  } while (queue.EnqueueBlob(buf.data(), buf.size()) != kBadPos);
   record.pop_back();
   printf("\n");
 
@@ -349,7 +348,7 @@ void TestBlobQueue() {
     buf = std::string(fill, amt);
     printf("%d[%zd], ", fill, amt);
     fill++;
-  } while (queue.EnqueueBlob(buf.data(), buf.size()) != BlobQueue::kBadPos);
+  } while (queue.EnqueueBlob(buf.data(), buf.size()) != kBadPos);
   record.pop_back();
   printf("\n");
   printf("Total In Queue %zd\n", record.size());
