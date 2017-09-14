@@ -17,14 +17,14 @@ struct Metadata {
   std::atomic<size_t> back;
 };
 
+struct Entry {
+  Entry() : ready(false), size(0) {}
+  std::atomic<bool> ready; // TODO(ajwong): fence?
+  size_t size;
+};
+
 class EntryQueue {
  public:
-  struct Entry {
-    Entry() : ready(false), size(0) {}
-    std::atomic<bool> ready; // TODO(ajwong): fence?
-    size_t size;
-  };
-
   EntryQueue(Metadata* metadata, Entry* queue, size_t max_elements)
     : metadata_(metadata),
       max_elements_(max_elements),
@@ -64,33 +64,28 @@ class EntryQueue {
     return &queue_[back];
   }
 
-  enum Status {
-    OK,
-    EMPTY,
-    NOT_READY,
-  };
-
-  Status Dequeue(size_t* size, bool peek_only = false) {
+  Entry* PeekBack() {
     size_t front = metadata_->front;
     size_t back = metadata_->back;
 
     if (front == back) {
-      return EMPTY;
+      return nullptr;
     }
 
-    if (!queue_[front].ready) {
-      return NOT_READY;
-    }
+    return &queue_[front];
+  }
 
-    // Read the front.
-    *size = queue_[front].size;
-    if (peek_only) return OK;
+  void PopBack() {
+    size_t front = metadata_->front;
+    size_t back = metadata_->back;
+
+    assert (front != back);
+
+    // Clear ready to preserve invariant on PushEntry that the ready bit
+    // is false.
     queue_[front].ready = false;
 
-    size_t new_front = (metadata_->front + 1) % max_elements_;
-    metadata_->front = new_front;
-
-    return OK;
+    metadata_->front = (metadata_->front + 1) % max_elements_;
   }
 
  private:
@@ -186,7 +181,7 @@ class PCQueue {
   }
 
   bool Enqueue(const char* data, size_t size) {
-    EntryQueue::Entry* entry = nullptr;
+    Entry* entry = nullptr;
     // Okay to spin because consumer will eventually wake up.
     while ((entry = entry_queue_.PushEntry()) == nullptr);
     entry->size = size;
@@ -205,29 +200,24 @@ class PCQueue {
 
   Status Dequeue(char* data, size_t* size) {
     size_t saved_size = *size;
-    size_t front_size;
-    switch (entry_queue_.Dequeue(&front_size, true)) {
-      case EntryQueue::NOT_READY:
-        return NOT_READY;
-
-      case EntryQueue::EMPTY:
-        return EMPTY;
-
-      case EntryQueue::OK:
-        break;
+    Entry* entry = entry_queue_.PeekBack();
+    if (!entry) {
+      return EMPTY;
     }
-    *size = front_size;
-    if (front_size > saved_size) {
+
+    if (!entry->ready) {
+      return NOT_READY;
+    }
+
+    *size = entry->size;
+    if (*size > saved_size) {
       return BUFFER_TOO_SMALL;
     }
 
     // Okay, big enough.
     blob_queue_.Dequeue(data, *size);
 
-    // TODO(ajwong): This should be peek + pop interface like stl.
-    // This should assert on anything other than ok here.
-    entry_queue_.Dequeue(&front_size);
-
+    entry_queue_.PopBack();
     return OK;
   }
 
@@ -367,7 +357,7 @@ void TestBlobQueue() {
 void TestEntryQueue() {
   EntryQueue queue = EntryQueue::Create(region, sizeof(region), true);
   std::deque<size_t> amts;
-  EntryQueue::Entry* entry = nullptr;
+  Entry* entry = nullptr;
   while ((entry = queue.PushEntry()) != nullptr) {
     size_t amt = rand();
     entry->size = amt;
@@ -379,10 +369,13 @@ void TestEntryQueue() {
 
   printf("Total In Queue %zd\n", amts.size());
 
-  size_t out;
-  assert(queue.Dequeue(&out) == EntryQueue::OK);
-  printf ("Dequeued %zd\n ", out);
-  assert(out == amts.front());
+  entry = queue.PeekBack();
+  assert(entry && entry->ready);
+  printf ("Dequeued %zd\n ", entry->size);
+  assert(entry->size == amts.front());
+  queue.PopBack();
+  // Breaks API contract to inspect, but we know we're one thread.
+  assert(!entry->ready);
   amts.pop_front();
 
   while ((entry = queue.PushEntry()) != nullptr) {
@@ -398,9 +391,13 @@ void TestEntryQueue() {
 
   printf("Popping: ");
   size_t dequeued = 0;
-  while (queue.Dequeue(&out) == EntryQueue::OK) {
-    printf ("%zd[%zd], ", out, amts.front());
-    assert(out == amts.front());
+  while ((entry = queue.PeekBack()) != nullptr) {
+    assert(entry->ready);
+    printf ("%zd[%zd], ", entry->size, amts.front());
+    assert(entry->size == amts.front());
+    queue.PopBack();
+    // Breaks API contract to inspect, but we know we're one thread.
+    assert(!entry->ready);
     amts.pop_front();
     dequeued++;
   }
