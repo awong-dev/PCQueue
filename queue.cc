@@ -296,17 +296,17 @@ void TestPCQueue() {
 
 void TestBlobQueue() {
   BlobQueue queue = BlobQueue::Create(region, sizeof(region), true);
-  struct Entry {
-    Entry(char fill, size_t size) : fill(fill), size(size) {}
+  struct TestData {
+    TestData(char fill, size_t size) : fill(fill), size(size) {}
     char fill;
     size_t size;
   };
-  std::deque<Entry> record;
+  std::deque<TestData> record;
   char fill = 'a';
   std::string buf;
   do {
     size_t amt = (rand() % 127) +1;
-    record.push_back(Entry(fill, amt));
+    record.push_back(TestData(fill, amt));
     buf = std::string(amt, fill);
     printf("%d[%zd], ", fill, amt);
     fill++;
@@ -327,7 +327,7 @@ void TestBlobQueue() {
 
   do {
     size_t amt = (rand() % 127) +1;
-    record.push_back(Entry(fill, amt));
+    record.push_back(TestData(fill, amt));
     buf = std::string(fill, amt);
     printf("%d[%zd], ", fill, amt);
     fill++;
