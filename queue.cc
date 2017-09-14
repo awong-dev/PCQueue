@@ -18,8 +18,9 @@ struct Metadata {
 };
 
 struct Entry {
-  Entry() : ready(false), size(0) {}
+  Entry() : ready(false), queue_position(0), size(0) {}
   std::atomic<bool> ready; // TODO(ajwong): fence?
+  size_t queue_position;
   size_t size;
 };
 
@@ -113,7 +114,9 @@ class BlobQueue {
     return BlobQueue(metadata, queue, size);
   }
 
-  bool Enqueue(const char* data, size_t size) {
+  static constexpr size_t kBadPos = static_cast<size_t>(-1);
+
+  size_t EnqueueBlob(const char* data, size_t size) {
     size_t front, back, new_back, new_back_no_mod;
     do {
       front = metadata_->front;
@@ -122,10 +125,10 @@ class BlobQueue {
       new_back = new_back_no_mod % queue_size_;
       if (back >= front) {
         if (new_back < new_back_no_mod && new_back >= front)
-          return false;
+          return kBadPos;
       } else {
         if (new_back < new_back_no_mod || new_back_no_mod > front)
-          return false;
+          return kBadPos;
       }
 
       // Reserve the space. Now it's ours.
@@ -135,13 +138,13 @@ class BlobQueue {
     if (new_back_no_mod < queue_size_) {
       memcpy(queue_ + back , data, size);
     } else {
-      int left_over = queue_size_ - back;
-      int first_amt = size - left_over;
+      int first_amt = queue_size_ - back;
+      int left_over = size - first_amt;
       memcpy(queue_ + back, data, first_amt);
       memcpy(queue_, data + first_amt, left_over);
     }
 
-    return true;
+    return back;
   }
 
   // It's assumed that an external structure is tracking size.
@@ -181,14 +184,15 @@ class PCQueue {
   }
 
   bool Enqueue(const char* data, size_t size) {
-    Entry* entry = nullptr;
-    // Okay to spin because consumer will eventually wake up.
-    while ((entry = entry_queue_.PushEntry()) == nullptr);
-    entry->size = size;
-    if (!blob_queue_.Enqueue(data, size))
+    Entry* entry = entry_queue_.PushEntry();
+    if (!entry) {
       return false;
+    }
+    entry->queue_position = blob_queue_.EnqueueBlob(data, size);
+    entry->size = size;
     entry->ready = true;
-    return true;
+    // queue_position == BlobQueue::kBadPos if the BlobQueue is out of space.
+    return entry->queue_position != BlobQueue::kBadPos;
   }
 
   enum Status {
@@ -199,25 +203,35 @@ class PCQueue {
   };
 
   Status Dequeue(char* data, size_t* size) {
+    Entry* entry = nullptr;
+    for (;;) {
+      entry = entry_queue_.PeekBack();
+      if (!entry) {
+        return EMPTY;
+      }
+
+      if (!entry->ready) {
+        return NOT_READY;
+      }
+
+      // Skip tombstoned entries.
+      if (entry->queue_position != BlobQueue::kBadPos) {
+        break;
+      }
+      printf("\nSkip toombstone\n");
+      entry_queue_.PopBack();
+    }
+
     size_t saved_size = *size;
-    Entry* entry = entry_queue_.PeekBack();
-    if (!entry) {
-      return EMPTY;
-    }
-
-    if (!entry->ready) {
-      return NOT_READY;
-    }
-
     *size = entry->size;
-    if (*size > saved_size) {
+    if (entry->size > saved_size) {
       return BUFFER_TOO_SMALL;
     }
 
     // Okay, big enough.
-    blob_queue_.Dequeue(data, *size);
-
+    blob_queue_.Dequeue(data, entry->size);
     entry_queue_.PopBack();
+
     return OK;
   }
 
@@ -230,17 +244,17 @@ static char region[4096];
 
 void TestPCQueue() {
   PCQueue queue = PCQueue::Create(region, sizeof(region), true);
-  struct Entry {
-    Entry(char fill, size_t size) : fill(fill), size(size) {}
+  struct TestData {
+    TestData(char fill, size_t size) : fill(fill), size(size) {}
     char fill;
     size_t size;
   };
-  std::deque<Entry> record;
+  std::deque<TestData> record;
   char fill = 'a';
   std::string buf;
   do {
-    size_t amt = (rand() % 127) +1;
-    record.push_back(Entry(fill, amt));
+    size_t amt = (rand() % 512) +1;
+    record.push_back(TestData(fill, amt));
     buf = std::string(amt, fill);
     printf("%d[%zd], ", fill, amt);
     fill++;
@@ -256,16 +270,17 @@ void TestPCQueue() {
   PCQueue::Status status = queue.Dequeue(&out[0], &actual_out);
   assert(status == PCQueue::OK);
   assert(actual_out == record.front().size);
-  printf ("Dequeued %d, %zd\n ", out[0], out.size());
+  printf ("Dequeued %d[%zd]\n", out[0], out.size());
   for (char ch : out) {
     assert(ch == record.front().fill);
   }
   record.pop_front();
 
+  printf("Enqueuing until full\n");
   do {
     size_t amt = (rand() % 127) +1;
-    record.push_back(Entry(fill, amt));
-    buf = std::string(fill, amt);
+    record.push_back(TestData(fill, amt));
+    buf = std::string(amt, fill);
     printf("%d[%zd], ", fill, amt);
     fill++;
   } while (queue.Enqueue(buf.data(), buf.size()));
@@ -283,12 +298,14 @@ void TestPCQueue() {
     assert(status == PCQueue::OK);
     assert(actual_out == record.front().size);
     printf ("%d[%zd], ", out[0], out.size());
-    for (char ch : out) {
-      assert(ch == record.front().fill);
+    //for (char ch : out) {
+    for (size_t i = 0; i < out.size(); i++) {
+      assert(out[i] == record.front().fill);
     }
     dequeued++;
     record.pop_front();
   }
+  printf("\n");
 
   printf("Total Dequeued %zd\n", dequeued);
   assert(record.empty());
@@ -310,7 +327,7 @@ void TestBlobQueue() {
     buf = std::string(amt, fill);
     printf("%d[%zd], ", fill, amt);
     fill++;
-  } while (queue.Enqueue(buf.data(), buf.size()));
+  } while (queue.EnqueueBlob(buf.data(), buf.size()) != BlobQueue::kBadPos);
   record.pop_back();
   printf("\n");
 
@@ -325,13 +342,14 @@ void TestBlobQueue() {
   }
   record.pop_front();
 
+  printf("Enqueuing until full\n");
   do {
     size_t amt = (rand() % 127) +1;
     record.push_back(TestData(fill, amt));
     buf = std::string(fill, amt);
     printf("%d[%zd], ", fill, amt);
     fill++;
-  } while (queue.Enqueue(buf.data(), buf.size()));
+  } while (queue.EnqueueBlob(buf.data(), buf.size()) != BlobQueue::kBadPos);
   record.pop_back();
   printf("\n");
   printf("Total In Queue %zd\n", record.size());
@@ -349,6 +367,7 @@ void TestBlobQueue() {
     dequeued++;
     record.pop_front();
   }
+  printf("\n");
 
   printf("Total Dequeued %zd\n", dequeued);
   assert(record.empty());
@@ -378,6 +397,7 @@ void TestEntryQueue() {
   assert(!entry->ready);
   amts.pop_front();
 
+  printf("Enqueuing until full\n");
   while ((entry = queue.PushEntry()) != nullptr) {
     size_t amt = rand();
     entry->size = amt;
@@ -408,8 +428,8 @@ void TestEntryQueue() {
 }
 
 int main(void) {
-  TestEntryQueue();
-//  TestBlobQueue();
-//  TestPCQueue();
+  //TestEntryQueue();
+  //TestBlobQueue();
+  TestPCQueue();
   return 0;
 }
