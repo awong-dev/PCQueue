@@ -1,3 +1,6 @@
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstring>
 #include <cstdio>
@@ -5,6 +8,7 @@
 
 #include <deque>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -217,7 +221,6 @@ class PCQueue {
       if (entry->queue_position != kBadPos) {
         break;
       }
-      printf("\nSkip toombstone\n");
       entry_queue_.PopBack();
     }
 
@@ -241,15 +244,13 @@ class PCQueue {
 
 static char region[4096];
 
-void TestPCQueue() {
-  PCQueue queue = PCQueue::Create(region, sizeof(region), true);
-  struct TestData {
-    TestData(char fill, size_t size) : fill(fill), size(size) {}
-    char fill;
-    size_t size;
-  };
-  std::deque<TestData> record;
-  char fill = 'a';
+struct TestData {
+  TestData(char fill, size_t size) : fill(fill), size(size) {}
+  char fill;
+  size_t size;
+};
+
+void FillQueue(char& fill, std::deque<TestData>& record, PCQueue& queue) {
   std::string buf;
   do {
     size_t amt = (rand() % 512) +1;
@@ -260,63 +261,52 @@ void TestPCQueue() {
   } while (queue.Enqueue(buf.data(), buf.size()));
   record.pop_back();
   printf("\n");
+}
 
-  printf("Total In Queue %zd\n", record.size());
-
+size_t DrainQueue(size_t num_to_drain, std::deque<TestData>& record, PCQueue& queue) {
   std::vector<char> out;
-  out.resize(record.front().size);
-  size_t actual_out = record.front().size;
-  PCQueue::Status status = queue.Dequeue(&out[0], &actual_out);
-  assert(status == PCQueue::OK);
-  assert(actual_out == record.front().size);
-  printf ("Dequeued %d[%zd]\n", out[0], out.size());
-  for (char ch : out) {
-    assert(ch == record.front().fill);
-  }
-  record.pop_front();
-
-  printf("Enqueuing until full\n");
-  do {
-    size_t amt = (rand() % 127) +1;
-    record.push_back(TestData(fill, amt));
-    buf = std::string(amt, fill);
-    printf("%d[%zd], ", fill, amt);
-    fill++;
-  } while (queue.Enqueue(buf.data(), buf.size()));
-  record.pop_back();
-  printf("\n");
-  printf("Total In Queue %zd\n", record.size());
-
-  printf("Popping: ");
-
   size_t dequeued = 0;
-  while (!record.empty()) {
-    actual_out = record.front().size;
+  printf("Draining\n");
+  for (; !record.empty() && num_to_drain > 0; num_to_drain--) {
     out.resize(record.front().size);
+    size_t actual_out = record.front().size;
     PCQueue::Status status = queue.Dequeue(&out[0], &actual_out);
     assert(status == PCQueue::OK);
     assert(actual_out == record.front().size);
     printf ("%d[%zd], ", out[0], out.size());
-    //for (char ch : out) {
-    for (size_t i = 0; i < out.size(); i++) {
-      assert(out[i] == record.front().fill);
+    for (char ch : out) {
+      assert(ch == record.front().fill);
     }
     dequeued++;
     record.pop_front();
   }
-  printf("\n");
+  printf("Drained %zu\n", dequeued);
+  return dequeued;
+}
 
-  printf("Total Dequeued %zd\n", dequeued);
+void TestPCQueue() {
+  PCQueue queue = PCQueue::Create(region, sizeof(region), true);
+  std::deque<TestData> record;
+  char fill = 'a';
+  FillQueue(fill, record, queue);
+
+  printf("Total In Queue %zd\n", record.size());
+
+  size_t dequeued = DrainQueue(1, record, queue);
+  assert(dequeued == 1);
+
+  printf("Enqueuing until full\n");
+  FillQueue(fill, record, queue);
+  printf("Total In Queue %zd\n", record.size());
+
+  dequeued = DrainQueue(std::numeric_limits<size_t>::max(), record, queue);
+  assert(dequeued > 0);
+
   assert(record.empty());
 }
 
 void TestBlobQueue() {
   BlobQueue queue = BlobQueue::Create(region, sizeof(region), true);
-  struct TestData {
-    TestData(char fill, size_t size) : fill(fill), size(size) {}
-    char fill;
-    size_t size;
-  };
   std::deque<TestData> record;
   char fill = 'a';
   std::string buf;
@@ -426,9 +416,47 @@ void TestEntryQueue() {
   assert(amts.empty());
 }
 
+void TestSharedMem() {
+  constexpr size_t kShmemSize = 4096;
+  char buf[] = "/tmp/queue_shmem_XXXXXX";
+
+  // Create file that will be in ram and anonymous and correctly sized.
+  int fd = mkstemp(buf);
+  assert(fd != -1);
+  unlink(buf);
+  ftruncate(fd, kShmemSize);
+
+  // Create the shared memory.
+  void* shared_memory = mmap(NULL, kShmemSize, PROT_READ |PROT_WRITE,
+	 MAP_SHARED, fd, 0);
+  assert (shared_memory);
+
+  void* shared_memory2 = mmap(NULL, kShmemSize, PROT_READ |PROT_WRITE,
+	 MAP_SHARED, fd, 0);
+  assert (shared_memory2);
+  assert (shared_memory2 != shared_memory);
+  printf ("Shared memory created of size %zd at %p and %p\n",
+      kShmemSize,
+      shared_memory,
+      shared_memory2);
+
+  PCQueue producer = PCQueue::Create(shared_memory, kShmemSize, true);
+  PCQueue consumer = PCQueue::Create(shared_memory, kShmemSize, false);
+
+  char fill = 'a';
+  std::deque<TestData> record;
+  FillQueue(fill, record, producer);
+
+  DrainQueue(2, record, consumer);
+
+  FillQueue(fill, record, producer);
+  DrainQueue(std::numeric_limits<size_t>::max(), record, consumer);
+}
+
 int main(void) {
-  //TestEntryQueue();
-  //TestBlobQueue();
+  TestEntryQueue();
+  TestBlobQueue();
   TestPCQueue();
+  TestSharedMem();
   return 0;
 }
