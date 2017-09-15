@@ -84,8 +84,8 @@ class EntryQueue {
   }
 
   void PopFront() {
-    size_t front = metadata_->front;
-    size_t back = metadata_->back;
+    uint32_t front = metadata_->front;
+    uint32_t back = metadata_->back;
 
     assert (front != back);
 
@@ -93,7 +93,7 @@ class EntryQueue {
     // is false.
     queue_[front].ready = false;
 
-    metadata_->front = (front + 1) % max_elements_;
+    metadata_->front.compare_exchange_strong(front, (front + 1) % max_elements_);
   }
 
  private:
@@ -258,17 +258,17 @@ void FillQueue(char& fill, std::deque<TestData>& record, PCQueue& queue) {
     size_t amt = (rand() % 512) +1;
     record.push_back(TestData(fill, amt));
     buf = std::string(amt, fill);
-    printf("%d[%zd], ", fill, amt);
+    fprintf(stderr, "%d[%zd], ", fill, amt);
     fill++;
   } while (queue.Enqueue(buf.data(), buf.size()));
   record.pop_back();
-  printf("\n");
+  fprintf(stderr, "\n");
 }
 
 size_t DrainQueue(size_t num_to_drain, std::deque<TestData>& record, PCQueue& queue) {
   std::vector<char> out;
   size_t dequeued = 0;
-  printf("Draining\n");
+  fprintf(stderr, "Draining\n");
   for (; !record.empty() && num_to_drain > 0; num_to_drain--) {
     out.resize(record.front().size);
     size_t actual_out = record.front().size;
@@ -282,7 +282,7 @@ size_t DrainQueue(size_t num_to_drain, std::deque<TestData>& record, PCQueue& qu
     dequeued++;
     record.pop_front();
   }
-  printf("Drained %zu\n", dequeued);
+  fprintf(stderr, "Drained %zu\n", dequeued);
   return dequeued;
 }
 
@@ -292,14 +292,14 @@ void TestPCQueue() {
   char fill = 'a';
   FillQueue(fill, record, queue);
 
-  printf("Total In Queue %zd\n", record.size());
+  fprintf(stderr, "Total In Queue %zd\n", record.size());
 
   size_t dequeued = DrainQueue(1, record, queue);
   assert(dequeued == 1);
 
-  printf("Enqueuing until full\n");
+  fprintf(stderr, "Enqueuing until full\n");
   FillQueue(fill, record, queue);
-  printf("Total In Queue %zd\n", record.size());
+  fprintf(stderr, "Total In Queue %zd\n", record.size());
 
   dequeued = DrainQueue(std::numeric_limits<size_t>::max(), record, queue);
   assert(dequeued > 0);
@@ -316,13 +316,13 @@ void TestBlobQueue() {
     size_t amt = (rand() % 127) +1;
     record.push_back(TestData(fill, amt));
     buf = std::string(amt, fill);
-    printf("%d[%zd], ", fill, amt);
+    fprintf(stderr, "%d[%zd], ", fill, amt);
     fill++;
   } while (queue.EnqueueBlob(buf.data(), buf.size()) != kBadPos);
   record.pop_back();
-  printf("\n");
+  fprintf(stderr, "\n");
 
-  printf("Total In Queue %zd\n", record.size());
+  fprintf(stderr, "Total In Queue %zd\n", record.size());
 
   std::vector<char> out;
   out.resize(record.front().size);
@@ -333,19 +333,19 @@ void TestBlobQueue() {
   }
   record.pop_front();
 
-  printf("Enqueuing until full\n");
+  fprintf(stderr, "Enqueuing until full\n");
   do {
     size_t amt = (rand() % 127) +1;
     record.push_back(TestData(fill, amt));
     buf = std::string(fill, amt);
-    printf("%d[%zd], ", fill, amt);
+    fprintf(stderr, "%d[%zd], ", fill, amt);
     fill++;
   } while (queue.EnqueueBlob(buf.data(), buf.size()) != kBadPos);
   record.pop_back();
-  printf("\n");
-  printf("Total In Queue %zd\n", record.size());
+  fprintf(stderr, "\n");
+  fprintf(stderr, "Total In Queue %zd\n", record.size());
 
-  printf("Popping: ");
+  fprintf(stderr, "Popping: ");
 
   size_t dequeued = 0;
   while (!record.empty()) {
@@ -358,9 +358,9 @@ void TestBlobQueue() {
     dequeued++;
     record.pop_front();
   }
-  printf("\n");
+  fprintf(stderr, "\n");
 
-  printf("Total Dequeued %zd\n", dequeued);
+  fprintf(stderr, "Total Dequeued %zd\n", dequeued);
   assert(record.empty());
 }
 
@@ -375,9 +375,9 @@ void TestEntryQueue() {
     printf ("%zd, ", amts.back());
     entry->ready = true;
   }
-  printf("\n");
+  fprintf(stderr, "\n");
 
-  printf("Total In Queue %zd\n", amts.size());
+  fprintf(stderr, "Total In Queue %zd\n", amts.size());
 
   entry = queue.PeekFront();
   assert(entry && entry->ready);
@@ -388,7 +388,7 @@ void TestEntryQueue() {
   assert(!entry->ready);
   amts.pop_front();
 
-  printf("Enqueuing until full\n");
+  fprintf(stderr, "Enqueuing until full\n");
   while ((entry = queue.PushEntry()) != nullptr) {
     size_t amt = rand();
     entry->size = amt;
@@ -396,11 +396,11 @@ void TestEntryQueue() {
     printf ("%zd, ", amts.back());
     entry->ready = true;
   }
-  printf("\n");
+  fprintf(stderr, "\n");
 
-  printf("Total In Queue %zd\n", amts.size());
+  fprintf(stderr, "Total In Queue %zd\n", amts.size());
 
-  printf("Popping: ");
+  fprintf(stderr, "Popping: ");
   size_t dequeued = 0;
   while ((entry = queue.PeekFront()) != nullptr) {
     assert(entry->ready);
@@ -412,9 +412,9 @@ void TestEntryQueue() {
     amts.pop_front();
     dequeued++;
   }
-  printf("\n");
+  fprintf(stderr, "\n");
 
-  printf("Total Dequeued %zd\n", dequeued);
+  fprintf(stderr, "Total Dequeued %zd\n", dequeued);
   assert(amts.empty());
 }
 
@@ -483,7 +483,7 @@ void TestThreadedSharedMem() {
   PCQueue consumer = PCQueue::Create(shared_memory, kShmemSize, false);
 
   // Create test data.
-  static constexpr int kNumProducers = 5;
+  static constexpr int kNumProducers = 10;
   static constexpr int kDataPerProducer = 10;
   char fill = 0;
   std::vector<std::vector<std::string>> raw_test_data;
@@ -530,7 +530,7 @@ void TestThreadedSharedMem() {
       count++;
     }
   }
-  printf("Dequeued: %d\n", count);
+  fprintf(stderr, "Dequeued: %d\n", count);
 
   for (pthread_t th : threads) {
     int result = pthread_join(th, NULL);
