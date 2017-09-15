@@ -1,5 +1,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <cstddef>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <cassert>
 
 #include <deque>
+#include <array>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -70,7 +72,7 @@ class EntryQueue {
     return &queue_[back];
   }
 
-  Entry* PeekBack() {
+  Entry* PeekFront() {
     size_t front = metadata_->front;
     size_t back = metadata_->back;
 
@@ -81,7 +83,7 @@ class EntryQueue {
     return &queue_[front];
   }
 
-  void PopBack() {
+  void PopFront() {
     size_t front = metadata_->front;
     size_t back = metadata_->back;
 
@@ -91,7 +93,7 @@ class EntryQueue {
     // is false.
     queue_[front].ready = false;
 
-    metadata_->front = (metadata_->front + 1) % max_elements_;
+    metadata_->front = (front + 1) % max_elements_;
   }
 
  private:
@@ -208,7 +210,7 @@ class PCQueue {
   Status Dequeue(char* data, size_t* size) {
     Entry* entry = nullptr;
     for (;;) {
-      entry = entry_queue_.PeekBack();
+      entry = entry_queue_.PeekFront();
       if (!entry) {
         return EMPTY;
       }
@@ -221,7 +223,7 @@ class PCQueue {
       if (entry->queue_position != kBadPos) {
         break;
       }
-      entry_queue_.PopBack();
+      entry_queue_.PopFront();
     }
 
     size_t saved_size = *size;
@@ -232,7 +234,7 @@ class PCQueue {
 
     // Okay, big enough.
     blob_queue_.Dequeue(data, entry->size);
-    entry_queue_.PopBack();
+    entry_queue_.PopFront();
 
     return OK;
   }
@@ -377,11 +379,11 @@ void TestEntryQueue() {
 
   printf("Total In Queue %zd\n", amts.size());
 
-  entry = queue.PeekBack();
+  entry = queue.PeekFront();
   assert(entry && entry->ready);
   printf ("Dequeued %zd\n ", entry->size);
   assert(entry->size == amts.front());
-  queue.PopBack();
+  queue.PopFront();
   // Breaks API contract to inspect, but we know we're one thread.
   assert(!entry->ready);
   amts.pop_front();
@@ -400,11 +402,11 @@ void TestEntryQueue() {
 
   printf("Popping: ");
   size_t dequeued = 0;
-  while ((entry = queue.PeekBack()) != nullptr) {
+  while ((entry = queue.PeekFront()) != nullptr) {
     assert(entry->ready);
     printf ("%zd[%zd], ", entry->size, amts.front());
     assert(entry->size == amts.front());
-    queue.PopBack();
+    queue.PopFront();
     // Breaks API contract to inspect, but we know we're one thread.
     assert(!entry->ready);
     amts.pop_front();
@@ -453,10 +455,96 @@ void TestSharedMem() {
   DrainQueue(std::numeric_limits<size_t>::max(), record, consumer);
 }
 
+void TestThreadedSharedMem() {
+  constexpr size_t kShmemSize = 4096;
+  char buf[] = "/tmp/queue_shmem_XXXXXX";
+
+  // Create file that will be in ram and anonymous and correctly sized.
+  int fd = mkstemp(buf);
+  assert(fd != -1);
+  unlink(buf);
+  ftruncate(fd, kShmemSize);
+
+  // Create the shared memory.
+  void* shared_memory = mmap(NULL, kShmemSize, PROT_READ |PROT_WRITE,
+	 MAP_SHARED, fd, 0);
+  assert (shared_memory);
+
+  void* shared_memory2 = mmap(NULL, kShmemSize, PROT_READ |PROT_WRITE,
+	 MAP_SHARED, fd, 0);
+  assert (shared_memory2);
+  assert (shared_memory2 != shared_memory);
+  printf ("Shared memory created of size %zd at %p and %p\n",
+      kShmemSize,
+      shared_memory,
+      shared_memory2);
+
+  PCQueue producer = PCQueue::Create(shared_memory, kShmemSize, true);
+  PCQueue consumer = PCQueue::Create(shared_memory, kShmemSize, false);
+
+  // Create test data.
+  static constexpr int kNumProducers = 5;
+  static constexpr int kDataPerProducer = 10;
+  char fill = 0;
+  std::vector<std::vector<std::string>> raw_test_data;
+  raw_test_data.resize(kNumProducers);
+  for (std::vector<std::string>& test_set : raw_test_data) {
+    for (int i = 0; i < kDataPerProducer; ++i) {
+      test_set.emplace_back(rand() % 1024, fill++);
+    }
+  }
+  
+  // Start the threads
+  std::vector<pthread_t> threads;
+  threads.resize(kNumProducers);
+  struct ThreadMain {
+    struct ThreadData {
+      const std::vector<std::string>* test_set;
+      PCQueue* producer;
+      int id;
+    };
+    static void* Main(void* ctx) {
+      const ThreadData& thread_data = *reinterpret_cast<ThreadData*>(ctx);
+      for (const std::string& str : *thread_data.test_set) {
+        while (!thread_data.producer->Enqueue(str.data(), str.size()));
+      }
+      return nullptr;
+    }
+  };
+  std::array<ThreadMain::ThreadData, kNumProducers> thread_data;
+  for (int i = 0; i < threads.size(); ++i) {
+    thread_data[i].test_set = &raw_test_data[i];
+    thread_data[i].producer = &producer;
+    thread_data[i].id = i;
+    pthread_create(&threads[i], NULL, &ThreadMain::Main, &thread_data[i]);
+  }
+
+  static std::array<char, 2048> output;
+  PCQueue::Status status = PCQueue::OK;
+  int count = 0;
+  sleep(2); // BEST SYNCHRONIZATION IN THE WORLD.
+  while (status != PCQueue::EMPTY) {
+    size_t actual_size = output.size();
+    status = consumer.Dequeue(&output[0], &actual_size);
+    if (status == PCQueue::OK) {
+      count++;
+    }
+  }
+  printf("Dequeued: %d\n", count);
+
+  for (pthread_t th : threads) {
+    int result = pthread_join(th, NULL);
+    assert(result == 0);
+  }
+}
+
 int main(void) {
+  /*
   TestEntryQueue();
   TestBlobQueue();
   TestPCQueue();
   TestSharedMem();
+  */
+  TestThreadedSharedMem();
   return 0;
 }
